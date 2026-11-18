@@ -601,6 +601,28 @@ bool ScaledDotProductAttention::use_fallback(
     bool output_logsumexp,
     bool force_fused,
     Stream s) {
+  // cuDNN keeps the input dtype for the output. A returned lse with half
+  // inputs needs float32 output, so it uses the unfused path.
+  if (output_logsumexp && !is_training && q.dtype() != float32) {
+    if (force_fused) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] force_fused=True but no fused "
+          "kernel is available: float32 output for half-precision inputs is "
+          "not supported by the CUDA fused attention kernels.");
+    }
+    return true;
+  }
+  // An array mask can hide all keys of a row. Only the unfused path gives
+  // that row lse = -inf and a zero output.
+  if (output_logsumexp && !is_training && has_arr_mask) {
+    if (force_fused) {
+      throw std::invalid_argument(
+          "[scaled_dot_product_attention] force_fused=True but no fused "
+          "kernel is available: the CUDA fused attention kernels do not "
+          "return the logsumexp with an array mask.");
+    }
+    return true;
+  }
   auto [has_fused, reason] = has_fused_kernel(
       q, k, v, has_arr_mask, do_causal, window_size, output_logsumexp, s);
   if (force_fused) {
@@ -647,22 +669,34 @@ void ScaledDotProductAttention::eval_gpu(
     stats = outputs[1];
   }
 
+  // A graph made on another backend can ask for float32 output from half
+  // inputs. cuDNN writes the input dtype, so the output is cast after.
+  bool cast_out = out.dtype() != q.dtype();
   if (supports_sdpa_cudnn(q, k, v, has_arr_mask, do_causal_, s)) {
     if (sinks) {
       sinks = prepare_sdpa_sinks(*sinks, s);
     }
+    array o = cast_out ? array(out.shape(), q.dtype(), nullptr, {}) : out;
     sdpa_cudnn(
         q,
         k,
         v,
         scale_,
-        out,
+        o,
         stats,
         do_causal_,
         mask_arr,
         sinks,
         output_logsumexp_,
         s);
+    if (cast_out) {
+      copy_gpu(o, out, CopyType::General, s);
+      cu::get_command_encoder(s).add_temporary(o);
+    }
+  } else if (output_logsumexp_ || cast_out) {
+    throw std::runtime_error(
+        "[ScaledDotProductAttention] The CUDA vector attention kernel does "
+        "not return the logsumexp or a float32 output for half inputs.");
   } else {
     sdpa_vector(q, k, v, scale_, out, do_causal_, sinks, s);
   }

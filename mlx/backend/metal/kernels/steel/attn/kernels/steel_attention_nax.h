@@ -1,5 +1,6 @@
 // Copyright © 2024-26 Apple Inc.
 
+#include "mlx/backend/metal/kernels/steel/attn/attn_out.h"
 #include "mlx/backend/metal/kernels/steel/attn/nax.h"
 #include "mlx/backend/metal/kernels/steel/attn/params.h"
 #include "mlx/backend/metal/kernels/steel/attn/transforms.h"
@@ -117,7 +118,8 @@ template <
   V += tidl.z * params->V_strides[0] + // Batch
       kv_head_idx * params->V_strides[1]; // Head
 
-  O += tidl.z * params->O_strides[0] + // Batch
+  AttnOut<T> out(O);
+  out += tidl.z * params->O_strides[0] + // Batch
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
 
@@ -528,7 +530,9 @@ template <
   metal::vec<AccumType, kRowsPT> rcp;
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kRowsPT; ++i) {
-    rcp[i] = 1.f / sum_score[i];
+    // With save_lse, an empty row gets O = 0 (its lse is -inf).
+    bool empty = save_lse && max_score[i] == Limits<AccumType>::finite_min;
+    rcp[i] = empty ? 0.f : 1.f / sum_score[i];
   }
 
   Otile.template row_bin_op<MulOp>(rcp);
@@ -538,21 +542,25 @@ template <
     for (short i = 0; i < kRowsPT; ++i) {
       const short r = tm + i * otile_t::kFragRowsJump + sm;
       if (align_Q || !is_last_q || r < params->qL_rem) {
-        lse[r] = max_score[i] * M_LN2_F + metal::log(sum_score[i]);
+        lse[r] = (max_score[i] == Limits<AccumType>::finite_min)
+            ? -INFINITY
+            : max_score[i] * M_LN2_F + metal::log(sum_score[i]);
       }
     }
   }
 
   // Store results
-  O += tm * int(params->O_strides[2]);
+  out += tm * int(params->O_strides[2]);
 
   if (!align_Q && is_last_q) {
     if (lim_rows_q <= 0)
       return;
-
-    Otile.store_rows(O, int(params->O_strides[2]), lim_rows_q);
+    out.store([&](auto dst, auto) {
+      Otile.store_rows(dst, int(params->O_strides[2]), lim_rows_q);
+    });
   } else {
-    Otile.store(O, int(params->O_strides[2]));
+    out.store(
+        [&](auto dst, auto) { Otile.store(dst, int(params->O_strides[2])); });
   }
 }
 
@@ -607,7 +615,8 @@ template <
   V += tidl.z * params->V_strides[0] + // Batch
       kv_head_idx * params->V_strides[1]; // Head
 
-  O += tidl.z * params->O_strides[0] + // Batch
+  AttnOut<T> out(O);
+  out += tidl.z * params->O_strides[0] + // Batch
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
 
@@ -659,7 +668,7 @@ template <
   Q += tm * int(params->Q_strides[2]) + d_group * BDh;
   K += d_group * BDh;
   V += d_group * BDh;
-  O += tm * int(params->O_strides[2]) + d_group * BDh;
+  out += tm * int(params->O_strides[2]) + d_group * BDh;
 
   constexpr short kRowsPT = otile_t::kRowsPerThread;
 
@@ -1016,7 +1025,9 @@ template <
   metal::vec<AccumType, kRowsPT> rcp;
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kRowsPT; ++i) {
-    rcp[i] = 1.f / sum_score[i];
+    // With save_lse, an empty row gets O = 0 (its lse is -inf).
+    bool empty = save_lse && max_score[i] == Limits<AccumType>::finite_min;
+    rcp[i] = empty ? 0.f : 1.f / sum_score[i];
   }
 
   if (save_lse && d_group == 0 && sn == 0) {
@@ -1027,7 +1038,8 @@ template <
     for (short i = 0; i < kRowsPT; ++i) {
       const int row = lse_row_base + i * stile_t::kFragRowsJump + sm;
       if (row < params->qL) {
-        LSE[lse_head_off + row] = (sum_score[i] == 0)
+        LSE[lse_head_off + row] =
+            (max_score[i] == Limits<AccumType>::finite_min)
             ? -INFINITY
             : float(M_LN2_F * (max_score[i] + metal::log2(sum_score[i])));
       }
@@ -1039,9 +1051,12 @@ template <
   if (!align_Q && is_last_q) {
     if (lim_rows_q <= 0)
       return;
-    Otile.store_rows(O, int(params->O_strides[2]), lim_rows_q);
+    out.store([&](auto dst, auto) {
+      Otile.store_rows(dst, int(params->O_strides[2]), lim_rows_q);
+    });
   } else {
-    Otile.store(O, int(params->O_strides[2]));
+    out.store(
+        [&](auto dst, auto) { Otile.store(dst, int(params->O_strides[2])); });
   }
 }
 

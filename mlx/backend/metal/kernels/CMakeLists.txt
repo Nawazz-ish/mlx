@@ -97,6 +97,7 @@ set(STEEL_ATTN_HEADERS
     steel/utils/type_traits.h
     steel/utils/integral_constant.h
     steel/attn/attn.h
+    steel/attn/attn_out.h
     steel/attn/loader.h
     steel/attn/mma.h
     steel/attn/params.h
@@ -121,6 +122,7 @@ set(STEEL_NAX_HEADERS
 set(STEEL_NAX_ATTN_HEADERS
     steel/defines.h
     steel/utils.h
+    steel/attn/attn_out.h
     steel/attn/nax.h
     steel/utils/type_traits.h
     steel/utils/integral_constant.h

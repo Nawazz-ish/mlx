@@ -266,60 +266,41 @@ void init_fast(nb::module_& parent_module) {
          const std::variant<std::monostate, std::string, mx::array>& mask,
          const std::optional<mx::array>& sinks,
          bool force_fused,
-         mx::StreamOrDevice s) {
-        bool has_mask = !std::holds_alternative<std::monostate>(mask);
-        bool has_str_mask =
-            has_mask && std::holds_alternative<std::string>(mask);
-        bool has_arr_mask = has_mask && std::holds_alternative<mx::array>(mask);
-
-        if (has_mask) {
-          if (has_str_mask) {
-            auto mask_str = std::get<std::string>(mask);
-            if (mask_str != "causal") {
-              std::ostringstream msg;
-              msg << "[scaled_dot_product_attention] invalid mask option '"
-                  << mask_str << "'. Must be 'causal', or an array.";
-              throw std::invalid_argument(msg.str());
-            }
-            return mx::fast::scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale,
-                window_size,
-                mask_str,
-                std::nullopt,
-                sinks,
-                force_fused,
-                s);
-          } else {
-            auto mask_arr = std::get<mx::array>(mask);
-            return mx::fast::scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale,
-                window_size,
-                "",
-                mask_arr,
-                sinks,
-                force_fused,
-                s);
-          }
-
-        } else {
-          return mx::fast::scaled_dot_product_attention(
+         bool return_lse,
+         mx::StreamOrDevice s) -> nb::object {
+        auto run = [&](const std::string& mask_mode,
+                       std::optional<mx::array> mask_arr) -> nb::object {
+          auto out = mx::fast::scaled_dot_product_attention(
               queries,
               keys,
               values,
               scale,
               window_size,
-              "",
-              {},
+              mask_mode,
+              std::move(mask_arr),
               sinks,
               force_fused,
+              return_lse,
               s);
+          if (return_lse) {
+            return nb::make_tuple(std::move(out[0]), std::move(out[1]));
+          }
+          return nb::cast(std::move(out[0]));
+        };
+
+        if (std::holds_alternative<std::string>(mask)) {
+          auto mask_str = std::get<std::string>(mask);
+          if (mask_str != "causal") {
+            std::ostringstream msg;
+            msg << "[scaled_dot_product_attention] invalid mask option '"
+                << mask_str << "'. Must be 'causal', or an array.";
+            throw std::invalid_argument(msg.str());
+          }
+          return run(mask_str, std::nullopt);
+        } else if (std::holds_alternative<mx::array>(mask)) {
+          return run("", std::get<mx::array>(mask));
         }
+        return run("", std::nullopt);
       },
       "q"_a,
       "k"_a,
@@ -330,9 +311,10 @@ void init_fast(nb::module_& parent_module) {
       "mask"_a = nb::none(),
       "sinks"_a = nb::none(),
       "force_fused"_a = false,
+      "return_lse"_a = false,
       "stream"_a = nb::none(),
       nb::sig(
-          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float, window_size: int = -1, mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, stream: StreamOrDevice = None) -> array"),
+          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float, window_size: int = -1, mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, return_lse: bool = False, stream: StreamOrDevice = None) -> array | tuple[array, array]"),
       R"pbdoc(
         A fast implementation of multi-head attention: ``O = softmax(Q @ K.T, dim=-1) @ V``.
 
@@ -382,9 +364,34 @@ void init_fast(nb::module_& parent_module) {
                fused kernel is available. For certain configurations this would
                result in slower kernel getting used but can reduce memory
                consumption. Default: ``False``.
+            return_lse (bool, optional): If ``True``, also return the
+               float32 log-sum-exp of the attention scores with shape
+               ``[B, N_q, T_q, 1]``. For ``float16`` / ``bfloat16`` inputs the
+               output is float32 as well so partial results can be merged
+               without double rounding:
+
+               .. code-block:: python
+
+                 lse = mx.logaddexp(lse_1, lse_2)
+                 o = mx.exp(lse_1 - lse) * o_1 + mx.exp(lse_2 - lse) * o_2
+
+               When merging chunks, pass ``sinks`` to only one of the calls;
+               each call already folds sinks into its lse and output, so
+               including them in every chunk would count ``exp(sink)`` twice.
+               A row with no unmasked keys (and no sinks) has log-sum-exp
+               ``-inf`` and output ``0``. Without ``return_lse`` that row
+               gets the mean of ``V`` instead. If a row is ``-inf`` in all
+               chunks, the merge above gives NaN, so use weights such as
+               ``mx.where(lse == -mx.inf, 0, mx.exp(lse_1 - lse))``.
+               With ``T_q <= 8`` the unfused path computes the log-sum-exp.
+               On CUDA, ``float16`` / ``bfloat16`` inputs and an array mask
+               also use the unfused path. Differentiating a
+               ``return_lse=True`` call also uses the unfused path.
+               Default: ``False``.
 
         Returns:
-            array: The output array.
+            array or tuple(array, array): The output array, or ``(output, lse)``
+            when ``return_lse=True``.
 
         Example:
 

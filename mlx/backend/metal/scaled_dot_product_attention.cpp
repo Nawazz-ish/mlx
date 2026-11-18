@@ -244,7 +244,8 @@ void sdpa_full_self_attention_nax(
     int window_size_,
     const std::optional<array>& mask,
     const std::optional<array>& sinks,
-    array* lse) {
+    array* lse,
+    bool output_f32) {
   using namespace mlx::steel;
 
   int bd = q.shape(-1);
@@ -308,7 +309,8 @@ void sdpa_full_self_attention_nax(
       {&do_causal, MTL::DataType::DataTypeBool, 301},
       {&has_sinks, MTL::DataType::DataTypeBool, 302},
       {&save_lse, MTL::DataType::DataTypeBool, 303},
-      {&window_size, MTL::DataType::DataTypeInt, 304}};
+      {&window_size, MTL::DataType::DataTypeInt, 304},
+      {&output_f32, MTL::DataType::DataTypeBool, 305}};
 
   std::string base_name;
   concatenate(
@@ -347,7 +349,9 @@ void sdpa_full_self_attention_nax(
       "_save_lse_",
       (save_lse ? 't' : 'n'),
       "_window_",
-      (window_size > 0 ? std::to_string(window_size) : "n"));
+      (window_size > 0 ? std::to_string(window_size) : "n"),
+      "_output_f32_",
+      (output_f32 ? 't' : 'n'));
 
   auto& compute_encoder = metal::get_command_encoder(s);
 
@@ -441,7 +445,8 @@ void sdpa_full_self_attention_metal(
     int window_size_,
     const std::optional<array>& mask,
     const std::optional<array>& sinks,
-    array* lse /* = nullptr */) {
+    array* lse,
+    bool output_f32) {
   int D = q.shape(3);
 
   int qL = q.shape(2);
@@ -461,7 +466,8 @@ void sdpa_full_self_attention_metal(
         /* int window_size_ = */ window_size_,
         /* const std::optional<array>& mask = */ mask,
         /* const std::optional<array>& sinks = */ sinks,
-        /* array* lse = */ lse);
+        /* array* lse = */ lse,
+        /* bool output_f32 = */ output_f32);
   }
 
   // Pad head dims 72 and 80 to 96 to reach the NAX kernel. The added lanes
@@ -520,7 +526,8 @@ void sdpa_full_self_attention_metal(
         /* int window_size_ = */ window_size_,
         /* const std::optional<array>& mask = */ mask,
         /* const std::optional<array>& sinks = */ sinks,
-        /* array* lse = */ nullptr);
+        /* array* lse = */ nullptr,
+        /* bool output_f32 = */ false);
 
     // Slice the padded lanes back out into o's caller-chosen strides.
     copy_gpu_inplace(
@@ -569,7 +576,8 @@ void sdpa_full_self_attention_metal(
       {&do_causal, MTL::DataType::DataTypeBool, 301},
       {&has_sinks, MTL::DataType::DataTypeBool, 302},
       {&save_lse, MTL::DataType::DataTypeBool, 303},
-      {&window_size, MTL::DataType::DataTypeInt, 304}};
+      {&window_size, MTL::DataType::DataTypeInt, 304},
+      {&output_f32, MTL::DataType::DataTypeBool, 305}};
 
   std::string base_name;
   concatenate(
@@ -608,7 +616,9 @@ void sdpa_full_self_attention_metal(
       "_save_lse_",
       (save_lse ? 't' : 'n'),
       "_window_",
-      ((window_size > 0) ? std::to_string(window_size) : "n"));
+      ((window_size > 0) ? std::to_string(window_size) : "n"),
+      "_output_f32_",
+      (output_f32 ? 't' : 'n'));
 
   auto& compute_encoder = metal::get_command_encoder(s);
 
@@ -1178,6 +1188,7 @@ std::tuple<bool, std::string> has_fused_kernel(
     bool do_causal,
     bool has_sinks,
     int window_size,
+    bool is_training,
     bool output_logsumexp,
     Stream s) {
   if (s.device != Device::gpu) {
@@ -1190,15 +1201,24 @@ std::tuple<bool, std::string> has_fused_kernel(
         "the full attention kernel with a window requires the query sequence "
         "to be no longer than the key sequence."};
   }
-  if (output_logsumexp && window_size > 0) {
+  if (output_logsumexp && is_training && window_size > 0) {
     return {false, "window support for backward attention is NYI"};
   }
 
-  if (output_logsumexp && has_arr_mask) {
+  if (output_logsumexp && is_training && has_arr_mask) {
     return {
         false,
         "the backward pass does not support an array mask; only causal masking "
         "is implemented."};
+  }
+
+  // Only the full attention kernels write the logsumexp. This also applies to
+  // the training forward, which needs the logsumexp for the fused VJP.
+  if (output_logsumexp && q.shape(2) <= 8) {
+    return {
+        false,
+        "the vector attention kernels do not produce the logsumexp; it needs "
+        "a query length above 8."};
   }
 
   const int value_head_dim = v.shape(-1);
@@ -1228,6 +1248,15 @@ std::tuple<bool, std::string> has_fused_kernel(
           << "query head dim " << query_head_dim << " and value head dim "
           << value_head_dim << ".";
       return {false, msg.str()};
+    }
+    // float32 D=192 needs about 40KB of threadgroup memory, which is more than
+    // the 32KB limit. This applies to all calls, with or without the lse.
+    if (query_head_dim == 192 && value_head_dim == 192 &&
+        q.dtype() == float32) {
+      return {
+          false,
+          "the full attention kernel for head dim 192 does not fit in "
+          "threadgroup memory for float32."};
     }
     if (has_mask && !has_arr_mask &&
         !(query_sequence_length <= key_sequence_length && do_causal)) {
@@ -1661,6 +1690,7 @@ bool ScaledDotProductAttention::use_fallback(
       do_causal,
       has_sinks,
       window_size,
+      is_training,
       output_logsumexp,
       s);
   if (force_fused) {
@@ -1927,7 +1957,19 @@ void ScaledDotProductAttention::eval_gpu(
       sdpa_full_self_attention_blocked(s, d, q, k, v, scale_, o);
     } else {
       sdpa_full_self_attention_metal(
-          s, d, q, k, v, scale_, o, do_causal_, window_size_, mask, sinks, lse);
+          s,
+          d,
+          q,
+          k,
+          v,
+          scale_,
+          o,
+          do_causal_,
+          window_size_,
+          mask,
+          sinks,
+          lse,
+          /* output_f32 = */ o.dtype() != inputs[0].dtype());
     }
   }
 

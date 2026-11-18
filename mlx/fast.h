@@ -64,6 +64,24 @@ MLX_API array scaled_dot_product_attention(
     bool force_fused = false,
     StreamOrDevice s = {});
 
+/**
+ * Same as scaled_dot_product_attention. When return_lse is true, also returns
+ * the float32 logsumexp of the attention scores with shape [B, N_q, T_q, 1].
+ * For float16/bfloat16 inputs the output is float32 as well.
+ */
+MLX_API std::vector<array> scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    int window_size,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    bool force_fused,
+    bool return_lse,
+    StreamOrDevice s = {});
+
 /** Updates recurrent state with the gated delta rule. */
 MLX_API std::vector<array> gated_delta_update(
     const array& queries,

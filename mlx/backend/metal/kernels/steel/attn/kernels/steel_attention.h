@@ -1,6 +1,7 @@
 // Copyright © 2024-26 Apple Inc.
 
 #include "mlx/backend/metal/kernels/steel/attn/attn.h"
+#include "mlx/backend/metal/kernels/steel/attn/attn_out.h"
 
 using namespace mlx::steel;
 
@@ -110,7 +111,8 @@ template <
   V += tidl.z * params->V_strides[0] + // Batch
       kv_head_idx * params->V_strides[1]; // Head
 
-  O += tidl.z * params->O_strides[0] + // Batch
+  AttnOut<T> out(O);
+  out += tidl.z * params->O_strides[0] + // Batch
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
 
@@ -585,8 +587,15 @@ template <
     loader_v.next();
   }
 
-  // Normalize output
-  Otile.template row_bin_op<DivOp>(sum_score);
+  // Normalize output. With save_lse, an empty row gets O / inf = 0.
+  AccumType norm[kRowsPT];
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kRowsPT; ++i) {
+    bool empty = save_lse && max_score[i] == Limits<AccumType>::finite_min;
+    norm[i] =
+        empty ? metal::numeric_limits<AccumType>::infinity() : sum_score[i];
+  }
+  Otile.template row_bin_op<DivOp>(norm);
   threadgroup_barrier(mem_flags::mem_none);
 
   // Store the logsumexp for the backward pass
@@ -598,13 +607,16 @@ template <
     for (short i = 0; i < kRowsPT; ++i) {
       const short r = tm + sm + i * stile_t::kFragRows;
       if (align_Q || !is_last_q || r < params->qL_rem) {
-        lse[r] = M_LN2_F * (max_score[i] + metal::log2(sum_score[i]));
+        // Empty row: max stayed at finite_min (all keys masked, no sinks).
+        lse[r] = (max_score[i] == Limits<AccumType>::finite_min)
+            ? -INFINITY
+            : M_LN2_F * (max_score[i] + metal::log2(sum_score[i]));
       }
     }
   }
 
   // Store results
-  O += (tm + sm) * params->O_strides[2] + d_half * BVh + sn;
+  out += (tm + sm) * params->O_strides[2] + d_half * BVh + sn;
 
   if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
     auto dst_tile_dims = short2(BVh - sn, params->qL_rem - (tm + sm));
@@ -612,9 +624,15 @@ template <
     if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0)
       return;
 
-    Otile.template store_safe<T, 1, 1>(O, params->O_strides[2], dst_tile_dims);
+    out.store([&](auto dst, auto tag) {
+      Otile.template store_safe<metal::remove_addrspace_t<decltype(tag)>, 1, 1>(
+          dst, params->O_strides[2], dst_tile_dims);
+    });
   } else {
-    Otile.template store<T, 1, 1>(O, params->O_strides[2]);
+    out.store([&](auto dst, auto tag) {
+      Otile.template store<metal::remove_addrspace_t<decltype(tag)>, 1, 1>(
+          dst, params->O_strides[2]);
+    });
   }
 }
 
